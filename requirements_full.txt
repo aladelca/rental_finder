@@ -1,0 +1,29 @@
+# Full Project Dependencies
+# ========================
+# Includes dependencies for both data cleaning agent AND web scraping scripts
+
+# Data Cleaning Agent Dependencies
+openai>=1.0.0                    # OpenAI API client for GPT analysis
+python-dotenv>=1.0.0             # Environment variable management from .env files
+
+# Web Scraping Dependencies
+selenium>=4.15.0                 # Web scraping automation (updated for Python 3.13)
+pandas>=1.5.0                    # Data manipulation and analysis
+requests>=2.28.0                 # HTTP requests
+undetected-chromedriver>=3.5.4   # Stealth web driver (Python 3.13 compatible)
+webdriver-manager>=4.0.0         # Automatic webdriver management (updated)
+
+# Python 3.13 compatibility fix
+setuptools>=68.0.0               # Provides distutils replacement for Python 3.13
+
+# Additional utilities (if needed)
+beautifulsoup4>=4.11.0           # HTML parsing (optional)
+lxml>=4.9.0                      # XML/HTML processing (optional)
+numpy>=1.24.0                    # Numerical computing (pandas dependency)
+google-cloud-storage>=2.14.0     # GCS uploads for scraper
+
+# Development and testing (optional)
+pytest>=7.0.0                    # Testing framework
+black>=22.0.0                    # Code formatter
+flake8>=5.0.0                    # Code linting
+pyarrow>=14.0.0                  # Parquet support for pandas
