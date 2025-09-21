@@ -67,7 +67,7 @@ Necesito que analices el texto y me proporciones la siguiente información en fo
 
 {{
     "price_raw": "precio como aparece en el texto (ej: 'S/ 250,000', 'USD 180,000', 'Consultar precio') o 'N/A'",
-    "price_numeric": número sin comas ni símbolos o null,
+    "price_numeric": número sin comas ni símbolos o null, si hay precio en dolares y soles, usar el precio en soles. Tipicamente el precio debería estar entre 10 y 40000, si excede, revisa el formato y corrige los errores
     "property_type": identifica si es casa o departamento (solamente puede tener esos valores),
     "currency": "PEN", "USD" o "EUR",
     "has_price": true/false,
