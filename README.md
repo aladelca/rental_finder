@@ -8,7 +8,8 @@ End-to-end project to extract property data from Urbania.pe, clean it with an AI
 - **Comprehensive Data Extraction**: Extracts property details including price, location, amenities
 - **Pagination**: Clicks "Siguiente" and aggregates listings across multiple pages
 - **Detail Page Scraping**: Optional deep scraping of individual property pages
-- **Multiple Export Formats**: Saves data as CSV and JSON
+- **Cloud-first Storage**: Scraper and agents can read/write directly to Google Cloud Storage (GCS)
+- **Multiple Export Formats**: Saves data as CSV and JSON (locally or in GCS)
 - **Robust Error Handling**: Continues scraping even if individual listings fail
 - **Stealth Mode**: Configured to avoid detection as automated browser
 - **Logging**: Comprehensive logging for debugging and monitoring
@@ -35,22 +36,33 @@ End-to-end project to extract property data from Urbania.pe, clean it with an AI
 
 ### End-to-End Pipeline (Scrape → Clean → Predict)
 
-1) Scrape (con paginación):
+1) Scrape (con paginación) → guarda en GCS:
 ```bash
-python urbania_minimal_scraper.py
+python urbania_minimal_scraper.py \
+  --gcs-bucket urbania_scrapper \
+  --gcs-prefix raw_data \
+  --gcp-keyfile /ruta/a/tu_service_account.json \
+  --max-pages 50
 ```
-Genera archivos tipo `urbania_minimal_results_YYYYMMDD_HHMMSS.json/csv` con todas las páginas recorridas.
+El scraper sube los resultados (CSV/JSON) y snapshots de página a `gs://urbania_scrapper/raw_data/` (no escribe localmente).
 
-2) Clean (agente de limpieza con OpenAI):
+2) Clean (agente de limpieza con OpenAI) → lee de GCS y sube a GCS:
 ```bash
 # Configura tu API key (usa env.example como plantilla)
 cp env.example .env
 # edita .env y coloca OPENAI_API_KEY=sk-xxxx
 
-# Ejecuta el agente (por defecto procesa un lote inicial)
+# Variables opcionales en .env (o export):
+# GCP_KEYFILE=/ruta/a/tu_service_account.json
+# GCS_BUCKET=urbania_scrapper
+# GCS_PREFIX=clean_data
+# INPUT_GCS_URI=gs://urbania_scrapper/raw_data/urbania_minimal_results_YYYYMMDD_HHMMSS.json
+# CLOUD_ONLY=true  # para no escribir localmente
+
+# Ejecuta el agente (por defecto procesa un lote inicial, lee INPUT_GCS_URI si está definido)
 python data_cleaning_agent.py
 ```
-Producirá `cleaned_urbania_data_YYYYMMDD_HHMMSS.json` y archivos de progreso `cleaned_data_progress_*`.
+Sube `cleaned_urbania_data_YYYYMMDD_HHMMSS.json` a `gs://urbania_scrapper/clean_data/` y progreso a `gs://urbania_scrapper/clean_data/progress/`.
 
 3) Predict (WIP):
 - Sección por construir. La idea es entrenar modelos sobre el dataset limpio para estimar precios/atributos.
@@ -58,7 +70,7 @@ Producirá `cleaned_urbania_data_YYYYMMDD_HHMMSS.json` y archivos de progreso `c
 ### Quick Start (Minimal, with Pagination)
 
 ```bash
-python urbania_minimal_scraper.py
+python urbania_minimal_scraper.py --gcs-bucket urbania_scrapper --gcs-prefix raw_data --gcp-keyfile /ruta/a/key.json
 ```
 
 The minimal scraper waits for Cloudflare, extracts the first page, then clicks "Siguiente" to traverse multiple pages and saves a single CSV/JSON with all properties.
@@ -79,6 +91,13 @@ max_pages = 50  # number of pages to visit
 - `headless`: Run browser without GUI (default: False)
 - `delay_range`: Random delay between requests (default: (2, 5) seconds)
 - `scrape_details`: Extract additional data from detail pages (default: False)
+
+### GCS Options (Scraper)
+
+- `--gcs-bucket`: nombre del bucket (por defecto `urbania_scrapper`)
+- `--gcs-prefix`: prefijo/carpeta (por defecto `raw_data`)
+- `--gcp-keyfile`: ruta a JSON de service account
+- `--max-pages`: número de páginas a recorrer (por defecto 50)
 
 ### Data Fields Extracted
 
@@ -152,7 +171,7 @@ document.querySelectorAll('*').forEach(el => {
 
 ## Output Files
 
-The scraper and the cleaning agent generate several files:
+El scraper y los agentes generan varios archivos (en local o en GCS según configuración):
 
 - `urbania_minimal_results_YYYYMMDD_HHMMSS.csv`: Aggregated data (all pages)
 - `urbania_minimal_results_YYYYMMDD_HHMMSS.json`: Aggregated data (all pages)
@@ -162,6 +181,24 @@ The scraper and the cleaning agent generate several files:
 
 - `cleaned_urbania_data_YYYYMMDD_HHMMSS.json`: Datos ya limpiados por el agente
 - `cleaned_data_progress_YYYYMMDD_HHMMSS_batch_N.json`: Progreso de limpieza por lotes
+
+## Cleaning → Parquet Agent (GCS support)
+
+Convierte JSONs limpios a Parquet, con lectura/escritura desde GCS opcional.
+
+```bash
+python cleaning_to_parquet_agent.py \
+  --input-gcs-prefix gs://urbania_scrapper/clean_data \
+  --output-gcs-prefix gs://urbania_scrapper/processed_data \
+  --gcp-keyfile /ruta/a/tu_service_account.json \
+  --cloud-only
+```
+
+Flags clave:
+- `--input-dir` o `--input-gcs-prefix` (prioritario)
+- `--output-dir` y/o `--output-gcs-prefix`
+- `--gcp-keyfile` para autenticación
+- `--cloud-only` para evitar archivos locales
 
 Other scripts in the repo may still generate legacy files like `urbania_rentals_*.csv/json` and `urbania_scraper.log`.
 
