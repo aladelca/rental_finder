@@ -178,16 +178,18 @@ class MinimalUrbaniaScraper:
             self.driver.execute_script("window.scrollTo(0, 0);")
             time.sleep(2)
             
-            # Save page source for debugging
+            # Upload page source to GCS (cloud-only)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            with open(f'minimal_page_source_{timestamp}.html', 'w', encoding='utf-8') as f:
-                f.write(self.driver.page_source)
-            logger.info(f"💾 Page source saved for debugging")
-            # Upload page source to GCS if configured
-            try:
-                self.upload_to_gcs(f'minimal_page_source_{timestamp}.html')
-            except Exception:
-                pass
+            if self._gcs_bucket:
+                try:
+                    key = f"{self.gcs_prefix.rstrip('/')}/minimal_page_source_{timestamp}.html"
+                    blob = self._gcs_bucket.blob(key)
+                    blob.upload_from_string(self.driver.page_source, content_type="text/html")
+                    logger.info(f"☁️ Page source uploaded: gs://{self.gcs_bucket_name}/{key}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to upload page source to GCS: {e}")
+            else:
+                logger.info("ℹ️ GCS not configured; skipping page source upload.")
             
             # Try multiple selectors to find property elements
             selectors = [
@@ -400,32 +402,43 @@ class MinimalUrbaniaScraper:
             return None
 
     def save_simple_results(self, properties: List[Dict[str, Any]]):
-        """Save results in CSV and JSON"""
+        """Upload results to GCS in CSV and JSON (no local files)."""
         try:
             if not properties:
                 logger.warning("⚠️ No properties to save")
                 return
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # CSV
-            csv_filename = f'urbania_minimal_results_{timestamp}.csv'
-            with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+            if not self._gcs_bucket:
+                logger.warning("⚠️ GCS not configured; cannot upload results.")
+                return
+
+            # CSV (in-memory)
+            try:
                 if properties:
                     fieldnames = list(properties[0].keys())
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    for prop in properties:
-                        writer.writerow(prop)
-            logger.info(f"💾 CSV saved: {csv_filename}")
-            self.upload_to_gcs(csv_filename)
-            
-            # JSON
-            json_filename = f'urbania_minimal_results_{timestamp}.json'
-            with open(json_filename, 'w', encoding='utf-8') as f:
-                json.dump(properties, f, ensure_ascii=False, indent=2)
-            logger.info(f"💾 JSON saved: {json_filename}")
-            self.upload_to_gcs(json_filename)
+                else:
+                    fieldnames = []
+                from io import StringIO
+                csv_buf = StringIO()
+                writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
+                writer.writeheader()
+                for prop in properties:
+                    writer.writerow(prop)
+                csv_key = f"{self.gcs_prefix.rstrip('/')}/urbania_minimal_results_{timestamp}.csv"
+                self._gcs_bucket.blob(csv_key).upload_from_string(csv_buf.getvalue(), content_type="text/csv")
+                logger.info(f"☁️ CSV uploaded: gs://{self.gcs_bucket_name}/{csv_key}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to upload CSV to GCS: {e}")
+
+            # JSON (in-memory)
+            try:
+                json_key = f"{self.gcs_prefix.rstrip('/')}/urbania_minimal_results_{timestamp}.json"
+                json_str = json.dumps(properties, ensure_ascii=False, indent=2)
+                self._gcs_bucket.blob(json_key).upload_from_string(json_str, content_type="application/json; charset=utf-8")
+                logger.info(f"☁️ JSON uploaded: gs://{self.gcs_bucket_name}/{json_key}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to upload JSON to GCS: {e}")
             
             # Print summary
             self.print_summary(properties)

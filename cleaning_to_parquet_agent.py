@@ -11,9 +11,15 @@ import json
 import glob
 import argparse
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
 
 import pandas as pd
+
+try:
+    from google.cloud import storage
+except Exception:
+    storage = None
 
 
 DEFAULT_INPUT_DIR = "cleaned_data"
@@ -34,6 +40,46 @@ def read_all_cleaned_json(input_dir: str) -> List[Dict[str, Any]]:
                     records.extend(data)
                 elif isinstance(data, dict):
                     records.append(data)
+        except Exception:
+            continue
+    return records
+
+
+def _parse_gs_uri(uri: str) -> Tuple[str, str]:
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Invalid GCS URI: {uri}")
+    without = uri[len("gs://"):]
+    parts = without.split('/', 1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1].rstrip('/')
+
+
+def _get_gcs_client(gcp_keyfile: Optional[str]):
+    if storage is None:
+        raise RuntimeError("google-cloud-storage not installed")
+    if gcp_keyfile and Path(gcp_keyfile).exists():
+        return storage.Client.from_service_account_json(gcp_keyfile)
+    return storage.Client()
+
+
+def read_all_cleaned_json_gcs(prefix_uri: str, gcp_keyfile: Optional[str]) -> List[Dict[str, Any]]:
+    bucket_name, prefix = _parse_gs_uri(prefix_uri)
+    client = _get_gcs_client(gcp_keyfile)
+    bucket = client.bucket(bucket_name)
+    blobs = client.list_blobs(bucket, prefix=prefix)
+    records: List[Dict[str, Any]] = []
+    for blob in blobs:
+        name = blob.name
+        if not name.lower().endswith('.json'):
+            continue
+        try:
+            text = blob.download_as_text()
+            data = json.loads(text)
+            if isinstance(data, list):
+                records.extend(data)
+            elif isinstance(data, dict):
+                records.append(data)
         except Exception:
             continue
     return records
@@ -88,6 +134,21 @@ def write_parquet(df: pd.DataFrame, output_dir: str) -> str:
     out_path = os.path.join(output_dir, f"urbania_cleaned_{ts}.parquet")
     df.to_parquet(out_path, engine="pyarrow", index=False)
     return out_path
+
+
+def upload_file_to_gcs(local_path: str, dest_prefix_uri: str, gcp_keyfile: Optional[str]) -> Optional[str]:
+    """Upload a local file to gs://bucket/prefix, returns destination URI or None."""
+    try:
+        bucket_name, prefix = _parse_gs_uri(dest_prefix_uri)
+        client = _get_gcs_client(gcp_keyfile)
+        bucket = client.bucket(bucket_name)
+        fname = os.path.basename(local_path)
+        key = f"{prefix}/{fname}" if prefix else fname
+        blob = bucket.blob(key)
+        blob.upload_from_filename(local_path)
+        return f"gs://{bucket_name}/{key}"
+    except Exception:
+        return None
 
 
 def parse_amount(value: str) -> float | None:
@@ -314,15 +375,28 @@ def save_analysis(report: Dict[str, Any], output_dir: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Cleaned JSON → Parquet + Analysis Agent")
-    parser.add_argument("--input-dir", type=str, default=DEFAULT_INPUT_DIR, help="Directory with cleaned JSON files")
+    parser.add_argument("--input-dir", type=str, default=DEFAULT_INPUT_DIR, help="Directory with cleaned JSON files (ignored if --input-gcs-prefix is set)")
+    parser.add_argument("--input-gcs-prefix", type=str, default=None, help="GCS prefix (gs://bucket/path) to read JSON files from")
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR, help="Directory to write Parquet and analysis")
+    parser.add_argument("--output-gcs-prefix", type=str, default=None, help="GCS prefix (gs://bucket/path) to upload Parquet (and analysis)")
+    parser.add_argument("--gcp-keyfile", type=str, default=None, help="Path to GCP service account JSON key")
+    parser.add_argument("--cloud-only", action="store_true", help="Skip local writes; only upload to GCS")
     args = parser.parse_args()
 
     print("=== Cleaning → Parquet Agent ===")
     print(f"Input dir: {args.input_dir}")
+    print(f"Input GCS: {args.input_gcs_prefix or '-'}")
     print(f"Output dir: {args.output_dir}")
+    print(f"Output GCS: {args.output_gcs_prefix or '-'}")
 
-    records = read_all_cleaned_json(args.input_dir)
+    # Load from GCS if provided; else local directory
+    if args.input_gcs_prefix:
+        if storage is None:
+            print("ERROR: google-cloud-storage not installed; cannot read from GCS")
+            return
+        records = read_all_cleaned_json_gcs(args.input_gcs_prefix, args.gcp_keyfile)
+    else:
+        records = read_all_cleaned_json(args.input_dir)
     if not records:
         print("No cleaned JSON files found.")
         return
@@ -338,11 +412,36 @@ def main():
     # Deduplicate before writing
     df = deduplicate_df(df)
     parquet_path = write_parquet(df, args.output_dir)
-    print(f"Parquet written to: {parquet_path}")
+    if not args.cloud_only:
+        print(f"Parquet written to: {parquet_path}")
+    # Upload parquet to GCS if configured
+    if args.output_gcs_prefix:
+        dest = upload_file_to_gcs(parquet_path, args.output_gcs_prefix, args.gcp_keyfile)
+        if dest:
+            print(f"Parquet uploaded to: {dest}")
 
     report = basic_analysis(df)
     report_path = save_analysis(report, args.output_dir)
-    print(f"Analysis report saved to: {report_path}")
+    if not args.cloud_only:
+        print(f"Analysis report saved to: {report_path}")
+    # Optionally upload analysis to GCS as well
+    if args.output_gcs_prefix:
+        dest_report = upload_file_to_gcs(report_path, args.output_gcs_prefix, args.gcp_keyfile)
+        if dest_report:
+            print(f"Analysis uploaded to: {dest_report}")
+
+    # If cloud-only, remove local outputs
+    if args.cloud_only:
+        try:
+            if os.path.exists(parquet_path):
+                os.remove(parquet_path)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(report_path):
+                os.remove(report_path)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

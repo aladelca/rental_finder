@@ -19,6 +19,12 @@ from datetime import datetime
 import openai
 from openai import OpenAI
 from dotenv import load_dotenv
+from pathlib import Path
+
+try:
+    from google.cloud import storage
+except Exception:
+    storage = None
 
 # Load environment variables from .env file
 load_dotenv()
@@ -45,6 +51,83 @@ class PropertyDataCleaner:
         self.model = model
         self.processed_count = 0
         self.errors = []
+        # GCS config (defaults can be overridden from main)
+        self.gcs_bucket_name: str | None = os.getenv('GCS_BUCKET', 'urbania_scrapper')
+        self.gcs_prefix: str = os.getenv('GCS_PREFIX', 'clean_data')
+        self.gcp_keyfile: str | None = os.getenv('GCP_KEYFILE')
+        self.cloud_only: bool = str(os.getenv('CLOUD_ONLY', 'false')).lower() in ('1', 'true', 'yes')
+        self._gcs_client = None
+        self._gcs_bucket = None
+
+    def setup_gcs(self) -> bool:
+        """Initialize GCS client and bucket if library and config are available."""
+        try:
+            if not self.gcs_bucket_name:
+                return False
+            if storage is None:
+                print("WARNING: google-cloud-storage not installed. Skipping GCS setup.")
+                return False
+            if self.gcp_keyfile and Path(self.gcp_keyfile).exists():
+                self._gcs_client = storage.Client.from_service_account_json(self.gcp_keyfile)
+            else:
+                self._gcs_client = storage.Client()
+            self._gcs_bucket = self._gcs_client.bucket(self.gcs_bucket_name)
+            _ = self._gcs_bucket.exists()
+            print(f"GCS configured: gs://{self.gcs_bucket_name}/{self.gcs_prefix}")
+            return True
+        except Exception as e:
+            print(f"WARNING: GCS setup failed: {e}")
+            return False
+
+    def _gcs_upload_json_string(self, json_text: str, key_name: str) -> bool:
+        try:
+            if not self._gcs_bucket:
+                return False
+            key = f"{self.gcs_prefix.rstrip('/')}/{key_name}"
+            blob = self._gcs_bucket.blob(key)
+            blob.upload_from_string(json_text, content_type='application/json; charset=utf-8')
+            print(f"Uploaded to gs://{self.gcs_bucket_name}/{key}")
+            return True
+        except Exception as e:
+            print(f"WARNING: GCS upload failed for {key_name}: {e}")
+            return False
+
+    def _load_properties_from_source(self, source: str):
+        """Load JSON list/dict from local path or GCS gs://bucket/path URI."""
+        try:
+            if source.startswith('gs://'):
+                if storage is None:
+                    raise RuntimeError("google-cloud-storage not installed for GCS input")
+                # Parse gs://bucket/key
+                without = source[len('gs://'):]
+                parts = without.split('/', 1)
+                if len(parts) != 2:
+                    raise ValueError(f"Invalid GCS URI: {source}")
+                bkt, key = parts[0], parts[1]
+                # Ensure client
+                client = self._gcs_client
+                if client is None:
+                    if self.gcp_keyfile and Path(self.gcp_keyfile).exists():
+                        client = storage.Client.from_service_account_json(self.gcp_keyfile)
+                    else:
+                        client = storage.Client()
+                bucket = client.bucket(bkt)
+                blob = bucket.blob(key)
+                text = blob.download_as_text()
+                data = json.loads(text)
+            else:
+                with open(source, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            # Normalize to list
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                return [data]
+            else:
+                raise ValueError("Input JSON must be a list or object")
+        except Exception as e:
+            print(f"Error loading input from {source}: {e}")
+            return []
         
     def create_analysis_prompt(self, property_data: Dict[str, Any]) -> str:
         """Create a detailed prompt for GPT to analyze property data."""
@@ -234,9 +317,16 @@ Responde SOLO con el JSON, sin explicaciones adicionales.
         filename = f"cleaned_data/cleaned_data_progress_{timestamp}_batch_{processed_count}.json"
         
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(properties, f, ensure_ascii=False, indent=2)
-            print(f"  Progress saved: {filename}")
+            # Build JSON once
+            json_text = json.dumps(properties, ensure_ascii=False, indent=2)
+            # Local save (unless cloud-only)
+            if not self.cloud_only:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(json_text)
+                print(f"  Progress saved: {filename}")
+            # GCS upload under progress/
+            gcs_name = f"progress/cleaned_data_progress_{timestamp}_batch_{processed_count}.json"
+            self._gcs_upload_json_string(json_text, gcs_name)
         except Exception as e:
             print(f"  Error saving progress: {e}")
 
@@ -254,14 +344,12 @@ Responde SOLO con el JSON, sin explicaciones adicionales.
         print(f"Delay: {delay}s")
         print(f"=================================")
         
-        # Load data
-        try:
-            with open(input_file, 'r', encoding='utf-8') as f:
-                properties = json.load(f)
-            print(f"Loaded {len(properties)} properties from {input_file}")
-        except Exception as e:
-            print(f"Error loading input file: {e}")
+        # Load data (supports local path or gs:// URI)
+        properties = self._load_properties_from_source(input_file)
+        if not properties:
+            print("No input properties loaded. Aborting.")
             return
+        print(f"Loaded {len(properties)} properties from {input_file}")
         
         # Limit properties if specified
         if max_properties:
@@ -280,13 +368,17 @@ Responde SOLO con el JSON, sin explicaciones adicionales.
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = f"cleaned_urbania_data_{timestamp}.json"
         
-        # Save results
+        # Save results (local optional) and upload to GCS
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(cleaned_properties, f, ensure_ascii=False, indent=2)
-            print(f"Results saved to: {output_file}")
+            json_text = json.dumps(cleaned_properties, ensure_ascii=False, indent=2)
+            if not self.cloud_only:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(json_text)
+                print(f"Results saved to: {output_file}")
+            # Upload to GCS at root prefix
+            self._gcs_upload_json_string(json_text, Path(output_file).name)
         except Exception as e:
-            print(f"Error saving results: {e}")
+            print(f"Error saving/uploading results: {e}")
             return
         
         # Print summary
@@ -323,10 +415,12 @@ def main():
         return
     
     MODEL = os.getenv('OPENAI_MODEL', 'gpt-3.5-turbo')
-    INPUT_FILE = "urbania_minimal_results_20250920_190749.json"
+    # Input can be local path or GCS URI (gs://bucket/path). If INPUT_GCS_URI is set, it overrides.
+    INPUT_FILE = os.getenv('INPUT_GCS_URI') or os.getenv('INPUT_FILE', "urbania_minimal_results_20250920_190749.json")
     
     # Initialize cleaning agent
     cleaner = PropertyDataCleaner(api_key=API_KEY, model=MODEL)
+    cleaner.setup_gcs()
     
     # Configuration for testing - start with a small batch
     START_INDEX = 0
